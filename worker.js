@@ -2,6 +2,7 @@
 
 const SERVICE_NAME = 'whois.api.airat.top';
 const RDAP_BASE_URL = 'https://rdap.org/domain/';
+const WHOIS_FALLBACK_BASE_URL = 'https://www.whois.com/whois/';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -29,6 +30,19 @@ function normalizeValue(value) {
 
 function normalizeBoolean(value) {
   return typeof value === 'boolean' ? value : null;
+}
+
+function getDomainTld(domain) {
+  const labels = String(domain || '').split('.');
+  if (labels.length < 2) {
+    return '';
+  }
+
+  return String(labels[labels.length - 1] || '').toLowerCase();
+}
+
+function isRuDomain(domain) {
+  return getDomainTld(domain) === 'ru';
 }
 
 function jsonResponse(data, status = 200) {
@@ -440,6 +454,204 @@ function extractErrorMessage(body, fallbackStatus) {
   return `RDAP lookup failed with HTTP ${fallbackStatus}.`;
 }
 
+function safeJsonParse(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function decodeHtmlEntities(value) {
+  if (typeof value !== 'string' || value === '') {
+    return '';
+  }
+
+  return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+    const normalized = String(entity).toLowerCase();
+
+    if (normalized === 'amp') {
+      return '&';
+    }
+    if (normalized === 'lt') {
+      return '<';
+    }
+    if (normalized === 'gt') {
+      return '>';
+    }
+    if (normalized === 'quot') {
+      return '"';
+    }
+    if (normalized === 'apos') {
+      return '\'';
+    }
+    if (normalized === 'nbsp') {
+      return ' ';
+    }
+
+    if (normalized.startsWith('#x')) {
+      const code = Number.parseInt(normalized.slice(2), 16);
+      if (Number.isFinite(code) && code >= 0 && code <= 0x10FFFF) {
+        return String.fromCodePoint(code);
+      }
+      return match;
+    }
+
+    if (normalized.startsWith('#')) {
+      const code = Number.parseInt(normalized.slice(1), 10);
+      if (Number.isFinite(code) && code >= 0 && code <= 0x10FFFF) {
+        return String.fromCodePoint(code);
+      }
+      return match;
+    }
+
+    return match;
+  });
+}
+
+function extractRawWhoisFromHtml(html) {
+  if (typeof html !== 'string' || html === '') {
+    return null;
+  }
+
+  const rawBlockMatch = html.match(/<pre[^>]*class=(['"])[^'"]*\bdf-raw\b[^'"]*\1[^>]*>([\s\S]*?)<\/pre>/i);
+  if (!rawBlockMatch) {
+    return null;
+  }
+
+  return normalizeValue(decodeHtmlEntities(rawBlockMatch[2]).trim());
+}
+
+function normalizeNameserver(value) {
+  const firstToken = String(value || '').trim().split(/\s+/)[0] || '';
+  return normalizeValue(firstToken.replace(/\.$/, ''));
+}
+
+function parseWhoisKeyValueLines(rawWhois) {
+  if (typeof rawWhois !== 'string') {
+    return [];
+  }
+
+  const entries = [];
+
+  for (const line of rawWhois.split('\n')) {
+    const match = line.match(/^\s*([^:#][^:]*?)\s*:\s*(.+?)\s*$/);
+    if (!match) {
+      continue;
+    }
+
+    entries.push({
+      key: String(match[1] || '').toLowerCase().trim(),
+      value: String(match[2] || '').trim()
+    });
+  }
+
+  return entries;
+}
+
+function pickFirstWhoisValue(entries, keys) {
+  for (const wanted of keys) {
+    const found = entries.find((entry) => entry.key === wanted);
+    if (found) {
+      return normalizeValue(found.value);
+    }
+  }
+
+  return null;
+}
+
+function pickAllWhoisValues(entries, keys) {
+  const allowed = new Set(keys);
+
+  return entries
+    .filter((entry) => allowed.has(entry.key))
+    .map((entry) => normalizeValue(entry.value))
+    .filter(Boolean);
+}
+
+function splitStatusLines(value) {
+  if (!value) {
+    return [];
+  }
+
+  const prepared = String(value).replace(/<br\s*\/?>/gi, '\n');
+
+  return prepared
+    .split(/[\n,]/)
+    .map((item) => normalizeValue(item))
+    .filter(Boolean);
+}
+
+function extractWhoisFallbackData(rawWhois) {
+  const entries = parseWhoisKeyValueLines(rawWhois);
+
+  const domainName = pickFirstWhoisValue(entries, ['domain', 'domain name']);
+  const registrar = pickFirstWhoisValue(entries, ['registrar']);
+  const registrarIanaId = pickFirstWhoisValue(entries, ['registrar iana id', 'iana id']);
+  const created = pickFirstWhoisValue(entries, [
+    'created',
+    'creation date',
+    'registered on',
+    'registration time'
+  ]);
+  const expires = pickFirstWhoisValue(entries, [
+    'paid-till',
+    'registry expiry date',
+    'registrar registration expiration date',
+    'expiration date',
+    'expires on'
+  ]);
+  const updated = pickFirstWhoisValue(entries, ['last updated on', 'updated date', 'updated on', 'changed']);
+  const organization = pickFirstWhoisValue(entries, ['org', 'organization']);
+  const registrarEmail = pickFirstWhoisValue(entries, [
+    'registrar abuse contact email',
+    'email'
+  ]);
+  const registrarPhone = pickFirstWhoisValue(entries, [
+    'registrar abuse contact phone',
+    'phone'
+  ]);
+  const registrarUrl = pickFirstWhoisValue(entries, ['registrar url', 'url']);
+
+  const statusValues = [
+    ...pickAllWhoisValues(entries, ['state']),
+    ...pickAllWhoisValues(entries, ['status']),
+    ...pickAllWhoisValues(entries, ['domain status'])
+  ];
+  const status = statusValues
+    .flatMap((value) => splitStatusLines(value))
+    .filter((value, index, list) => list.indexOf(value) === index);
+
+  const nameserverValues = [
+    ...pickAllWhoisValues(entries, ['nserver']),
+    ...pickAllWhoisValues(entries, ['name server']),
+    ...pickAllWhoisValues(entries, ['nameserver'])
+  ];
+  const nameservers = nameserverValues
+    .map((value) => normalizeNameserver(value))
+    .filter(Boolean)
+    .filter((value, index, list) => list.indexOf(value) === index);
+
+  return {
+    domainName,
+    registrar,
+    registrarIanaId,
+    organization,
+    registrarEmail,
+    registrarPhone,
+    registrarUrl,
+    created,
+    expires,
+    updated,
+    status,
+    nameservers
+  };
+}
+
 function buildPayload(domain, rdapData, response) {
   const registrar = extractRegistrar(rdapData?.entities);
 
@@ -467,6 +679,88 @@ function buildPayload(domain, rdapData, response) {
   };
 }
 
+function buildWhoisFallbackPayload(domain, fallbackData, sourceUrl, status) {
+  const fallbackDomain = normalizeValue(fallbackData.domainName || domain);
+  const registrarName = normalizeValue(fallbackData.registrar || fallbackData.organization);
+
+  return {
+    ok: true,
+    query: {
+      domain
+    },
+    lookup: {
+      rdapUrl: normalizeValue(sourceUrl),
+      httpStatus: status,
+      source: 'whois-fallback'
+    },
+    rdap: {
+      handle: null,
+      ldhName: fallbackDomain ? fallbackDomain.toUpperCase() : null,
+      unicodeName: null,
+      status: Array.isArray(fallbackData.status) ? fallbackData.status : [],
+      registrar: {
+        name: registrarName,
+        ianaId: normalizeValue(fallbackData.registrarIanaId),
+        handle: null,
+        email: normalizeValue(fallbackData.registrarEmail),
+        url: normalizeValue(fallbackData.registrarUrl),
+        phone: normalizeValue(fallbackData.registrarPhone)
+      },
+      events: {
+        registration: normalizeValue(fallbackData.created),
+        expiration: normalizeValue(fallbackData.expires),
+        lastChanged: normalizeValue(fallbackData.updated),
+        lastUpdate: null,
+        transfer: null
+      },
+      nameservers: Array.isArray(fallbackData.nameservers) ? fallbackData.nameservers : [],
+      dnssecSigned: null
+    },
+    service: SERVICE_NAME,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+async function tryRuWhoisFallback(domain) {
+  if (!isRuDomain(domain)) {
+    return null;
+  }
+
+  const fallbackUrl = `${WHOIS_FALLBACK_BASE_URL}${encodeURIComponent(domain)}`;
+
+  let response;
+  try {
+    response = await fetch(fallbackUrl, {
+      headers: {
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': `${SERVICE_NAME}/1.0 (+https://airat.top)`
+      }
+    });
+  } catch {
+    return null;
+  }
+
+  if (!response.ok) {
+    return null;
+  }
+
+  let html;
+  try {
+    html = await response.text();
+  } catch {
+    return null;
+  }
+
+  const rawWhois = extractRawWhoisFromHtml(html);
+  if (!rawWhois) {
+    return null;
+  }
+
+  const fallbackData = extractWhoisFallbackData(rawWhois);
+
+  return buildWhoisFallbackPayload(domain, fallbackData, response.url || fallbackUrl, response.status);
+}
+
 async function performWhoisLookup(domain) {
   const rdapUrl = `${RDAP_BASE_URL}${encodeURIComponent(domain)}`;
 
@@ -486,22 +780,48 @@ async function performWhoisLookup(domain) {
     };
   }
 
-  let body;
+  let rawBody;
   try {
-    body = await response.json();
+    rawBody = await response.text();
   } catch {
     return {
       ok: false,
       status: 502,
-      error: 'Failed to parse RDAP response.'
+      error: 'Failed to read RDAP response.'
     };
   }
 
+  const body = safeJsonParse(rawBody);
+
   if (!response.ok) {
+    const ruFallbackPayload = await tryRuWhoisFallback(domain);
+    if (ruFallbackPayload) {
+      return {
+        ok: true,
+        payload: ruFallbackPayload
+      };
+    }
+
     return {
       ok: false,
       status: response.status,
       error: extractErrorMessage(body, response.status)
+    };
+  }
+
+  if (!body || typeof body !== 'object') {
+    const ruFallbackPayload = await tryRuWhoisFallback(domain);
+    if (ruFallbackPayload) {
+      return {
+        ok: true,
+        payload: ruFallbackPayload
+      };
+    }
+
+    return {
+      ok: false,
+      status: 502,
+      error: 'Failed to parse RDAP response.'
     };
   }
 
