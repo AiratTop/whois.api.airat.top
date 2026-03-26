@@ -1,9 +1,7 @@
 // WHOIS/RDAP API for Cloudflare Workers.
-import { connect } from 'cloudflare:sockets';
 
 const SERVICE_NAME = 'whois.api.airat.top';
 const RDAP_BASE_URL = 'https://rdap.org/domain/';
-const WHOIS_FALLBACK_BASE_URL = 'https://www.whois.com/whois/';
 const WHOIS_CO_IM_BASE_URL = 'https://whois.co.im/';
 
 const CORS_HEADERS = {
@@ -32,30 +30,6 @@ function normalizeValue(value) {
 
 function normalizeBoolean(value) {
   return typeof value === 'boolean' ? value : null;
-}
-
-function getDomainTld(domain) {
-  const labels = String(domain || '').split('.');
-  if (labels.length < 2) {
-    return '';
-  }
-
-  return String(labels[labels.length - 1] || '').toLowerCase();
-}
-
-function isRuDomain(domain) {
-  return getDomainTld(domain) === 'ru';
-}
-
-function getWhoisServerForDomain(domain) {
-  const tld = getDomainTld(domain);
-
-  const map = {
-    ru: 'whois.tcinet.ru',
-    im: 'whois.nic.im'
-  };
-
-  return normalizeValue(map[tld]);
 }
 
 function jsonResponse(data, status = 200) {
@@ -538,165 +512,9 @@ function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function extractRawWhoisFromHtml(html) {
-  if (typeof html !== 'string' || html === '') {
-    return null;
-  }
-
-  const rawBlockMatch = html.match(/<pre[^>]*class=(['"])[^'"]*\bdf-raw\b[^'"]*\1[^>]*>([\s\S]*?)<\/pre>/i);
-  if (!rawBlockMatch) {
-    return null;
-  }
-
-  return normalizeValue(decodeHtmlEntities(rawBlockMatch[2]).trim());
-}
-
 function normalizeNameserver(value) {
   const firstToken = String(value || '').trim().split(/\s+/)[0] || '';
   return normalizeValue(firstToken.replace(/\.$/, ''));
-}
-
-function parseWhoisKeyValueLines(rawWhois) {
-  if (typeof rawWhois !== 'string') {
-    return [];
-  }
-
-  const entries = [];
-
-  for (const line of rawWhois.split('\n')) {
-    const match = line.match(/^\s*([^:#][^:]*?)\s*:\s*(.+?)\s*$/);
-    if (!match) {
-      continue;
-    }
-
-    entries.push({
-      key: String(match[1] || '').toLowerCase().trim(),
-      value: String(match[2] || '').trim()
-    });
-  }
-
-  return entries;
-}
-
-function pickFirstWhoisValue(entries, keys) {
-  for (const wanted of keys) {
-    const found = entries.find((entry) => entry.key === wanted);
-    if (found) {
-      return normalizeValue(found.value);
-    }
-  }
-
-  return null;
-}
-
-function pickAllWhoisValues(entries, keys) {
-  const allowed = new Set(keys);
-
-  return entries
-    .filter((entry) => allowed.has(entry.key))
-    .map((entry) => normalizeValue(entry.value))
-    .filter(Boolean);
-}
-
-function splitStatusLines(value) {
-  if (!value) {
-    return [];
-  }
-
-  const prepared = String(value).replace(/<br\s*\/?>/gi, '\n');
-
-  return prepared
-    .split(/[\n,]/)
-    .map((item) => normalizeValue(item))
-    .filter(Boolean);
-}
-
-function extractWhoisFallbackData(rawWhois) {
-  const entries = parseWhoisKeyValueLines(rawWhois);
-
-  const domainName = pickFirstWhoisValue(entries, ['domain', 'domain name']);
-  const registrar = pickFirstWhoisValue(entries, ['registrar']);
-  const registrarIanaId = pickFirstWhoisValue(entries, ['registrar iana id', 'iana id']);
-  const created = pickFirstWhoisValue(entries, [
-    'created',
-    'creation date',
-    'registered on',
-    'registration time'
-  ]);
-  const expires = pickFirstWhoisValue(entries, [
-    'paid-till',
-    'expiry date',
-    'expiration date',
-    'expires',
-    'expires on',
-    'registry expiry date',
-    'registrar registration expiration date',
-    'renewal date'
-  ]);
-  const updated = pickFirstWhoisValue(entries, ['last updated on', 'updated date', 'updated on', 'changed']);
-  const organization = pickFirstWhoisValue(entries, ['org', 'organization']);
-  const registrarEmail = pickFirstWhoisValue(entries, [
-    'registrar abuse contact email',
-    'email'
-  ]);
-  const registrarPhone = pickFirstWhoisValue(entries, [
-    'registrar abuse contact phone',
-    'phone'
-  ]);
-  const registrarUrl = pickFirstWhoisValue(entries, ['registrar url', 'url']);
-
-  const statusValues = [
-    ...pickAllWhoisValues(entries, ['state']),
-    ...pickAllWhoisValues(entries, ['status']),
-    ...pickAllWhoisValues(entries, ['domain status'])
-  ];
-  const status = statusValues
-    .flatMap((value) => splitStatusLines(value))
-    .filter((value, index, list) => list.indexOf(value) === index);
-
-  const nameserverValues = [
-    ...pickAllWhoisValues(entries, ['nserver']),
-    ...pickAllWhoisValues(entries, ['name server']),
-    ...pickAllWhoisValues(entries, ['nameserver'])
-  ];
-  const nameservers = nameserverValues
-    .map((value) => normalizeNameserver(value))
-    .filter(Boolean)
-    .filter((value, index, list) => list.indexOf(value) === index);
-
-  return {
-    domainName,
-    registrar,
-    registrarIanaId,
-    organization,
-    registrarEmail,
-    registrarPhone,
-    registrarUrl,
-    created,
-    expires,
-    updated,
-    status,
-    nameservers
-  };
-}
-
-function looksLikeWhoisNotFound(rawWhois) {
-  if (typeof rawWhois !== 'string' || rawWhois.trim() === '') {
-    return true;
-  }
-
-  const body = rawWhois.toLowerCase();
-  const notFoundPatterns = [
-    'no match for',
-    'domain not found',
-    'not found',
-    'no entries found',
-    'object does not exist',
-    'status: available',
-    'no data found'
-  ];
-
-  return notFoundPatterns.some((pattern) => body.includes(pattern));
 }
 
 function hasMeaningfulWhoisData(parsed) {
@@ -877,143 +695,6 @@ function buildWhoisFallbackPayload(
   };
 }
 
-async function queryWhoisServer(hostname, queryDomain) {
-  let socket;
-  let reader;
-  let writer;
-
-  try {
-    socket = connect({
-      hostname,
-      port: 43
-    });
-
-    writer = socket.writable.getWriter();
-    const encoder = new TextEncoder();
-    await writer.write(encoder.encode(`${queryDomain}\r\n`));
-    await writer.close();
-
-    reader = socket.readable.getReader();
-    const decoder = new TextDecoder();
-
-    let response = '';
-    const timeoutId = setTimeout(() => {
-      try {
-        reader.cancel();
-      } catch {}
-
-      try {
-        socket.close();
-      } catch {}
-    }, 9000);
-
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-
-        if (value) {
-          response += decoder.decode(value, { stream: true });
-        }
-      }
-
-      response += decoder.decode();
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    return normalizeValue(response.trim());
-  } catch {
-    return null;
-  } finally {
-    try {
-      reader?.releaseLock();
-    } catch {}
-
-    try {
-      writer?.releaseLock();
-    } catch {}
-
-    try {
-      socket?.close();
-    } catch {}
-  }
-}
-
-async function tryWhoisTcpFallback(domain) {
-  const whoisServer = getWhoisServerForDomain(domain);
-  if (!whoisServer) {
-    return null;
-  }
-
-  const rawWhois = await queryWhoisServer(whoisServer, domain);
-  if (!rawWhois || looksLikeWhoisNotFound(rawWhois)) {
-    return null;
-  }
-
-  const fallbackData = extractWhoisFallbackData(rawWhois);
-  if (!hasMeaningfulWhoisData(fallbackData)) {
-    return null;
-  }
-
-  return buildWhoisFallbackPayload(
-    domain,
-    fallbackData,
-    `whois://${whoisServer}/${domain}`,
-    200,
-    'whois-tcp-fallback',
-    whoisServer
-  );
-}
-
-async function tryRuWhoisFallback(domain) {
-  if (!isRuDomain(domain)) {
-    return null;
-  }
-
-  const fallbackUrl = `${WHOIS_FALLBACK_BASE_URL}${encodeURIComponent(domain)}`;
-
-  let response;
-  try {
-    response = await fetch(fallbackUrl, {
-      headers: {
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'User-Agent': `${SERVICE_NAME}/1.0 (+https://airat.top)`
-      }
-    });
-  } catch {
-    return null;
-  }
-
-  if (!response.ok) {
-    return null;
-  }
-
-  let html;
-  try {
-    html = await response.text();
-  } catch {
-    return null;
-  }
-
-  const rawWhois = extractRawWhoisFromHtml(html);
-  if (!rawWhois) {
-    return null;
-  }
-
-  const fallbackData = extractWhoisFallbackData(rawWhois);
-
-  return buildWhoisFallbackPayload(
-    domain,
-    fallbackData,
-    response.url || fallbackUrl,
-    response.status,
-    'whois-web-fallback'
-  );
-}
-
 async function tryWhoisCoImFallback(domain) {
   const fallbackUrl = `${WHOIS_CO_IM_BASE_URL}${encodeURIComponent(domain)}`;
 
@@ -1092,27 +773,11 @@ async function performWhoisLookup(domain) {
   const body = safeJsonParse(rawBody);
 
   if (!response.ok) {
-    const tcpWhoisFallbackPayload = await tryWhoisTcpFallback(domain);
-    if (tcpWhoisFallbackPayload) {
-      return {
-        ok: true,
-        payload: tcpWhoisFallbackPayload
-      };
-    }
-
     const coImFallbackPayload = await tryWhoisCoImFallback(domain);
     if (coImFallbackPayload) {
       return {
         ok: true,
         payload: coImFallbackPayload
-      };
-    }
-
-    const ruFallbackPayload = await tryRuWhoisFallback(domain);
-    if (ruFallbackPayload) {
-      return {
-        ok: true,
-        payload: ruFallbackPayload
       };
     }
 
@@ -1124,27 +789,11 @@ async function performWhoisLookup(domain) {
   }
 
   if (!body || typeof body !== 'object') {
-    const tcpWhoisFallbackPayload = await tryWhoisTcpFallback(domain);
-    if (tcpWhoisFallbackPayload) {
-      return {
-        ok: true,
-        payload: tcpWhoisFallbackPayload
-      };
-    }
-
     const coImFallbackPayload = await tryWhoisCoImFallback(domain);
     if (coImFallbackPayload) {
       return {
         ok: true,
         payload: coImFallbackPayload
-      };
-    }
-
-    const ruFallbackPayload = await tryRuWhoisFallback(domain);
-    if (ruFallbackPayload) {
-      return {
-        ok: true,
-        payload: ruFallbackPayload
       };
     }
 
