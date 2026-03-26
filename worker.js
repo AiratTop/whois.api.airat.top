@@ -1,4 +1,5 @@
 // WHOIS/RDAP API for Cloudflare Workers.
+import { connect } from 'cloudflare:sockets';
 
 const SERVICE_NAME = 'whois.api.airat.top';
 const RDAP_BASE_URL = 'https://rdap.org/domain/';
@@ -43,6 +44,17 @@ function getDomainTld(domain) {
 
 function isRuDomain(domain) {
   return getDomainTld(domain) === 'ru';
+}
+
+function getWhoisServerForDomain(domain) {
+  const tld = getDomainTld(domain);
+
+  const map = {
+    ru: 'whois.tcinet.ru',
+    im: 'whois.nic.im'
+  };
+
+  return normalizeValue(map[tld]);
 }
 
 function jsonResponse(data, status = 200) {
@@ -600,10 +612,13 @@ function extractWhoisFallbackData(rawWhois) {
   ]);
   const expires = pickFirstWhoisValue(entries, [
     'paid-till',
+    'expiry date',
+    'expiration date',
+    'expires',
+    'expires on',
     'registry expiry date',
     'registrar registration expiration date',
-    'expiration date',
-    'expires on'
+    'renewal date'
   ]);
   const updated = pickFirstWhoisValue(entries, ['last updated on', 'updated date', 'updated on', 'changed']);
   const organization = pickFirstWhoisValue(entries, ['org', 'organization']);
@@ -652,6 +667,41 @@ function extractWhoisFallbackData(rawWhois) {
   };
 }
 
+function looksLikeWhoisNotFound(rawWhois) {
+  if (typeof rawWhois !== 'string' || rawWhois.trim() === '') {
+    return true;
+  }
+
+  const body = rawWhois.toLowerCase();
+  const notFoundPatterns = [
+    'no match for',
+    'domain not found',
+    'not found',
+    'no entries found',
+    'object does not exist',
+    'status: available',
+    'no data found'
+  ];
+
+  return notFoundPatterns.some((pattern) => body.includes(pattern));
+}
+
+function hasMeaningfulWhoisData(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return false;
+  }
+
+  return Boolean(
+    parsed.domainName
+    || parsed.registrar
+    || parsed.expires
+    || parsed.created
+    || parsed.updated
+    || (Array.isArray(parsed.nameservers) && parsed.nameservers.length > 0)
+    || (Array.isArray(parsed.status) && parsed.status.length > 0)
+  );
+}
+
 function buildPayload(domain, rdapData, response) {
   const registrar = extractRegistrar(rdapData?.entities);
 
@@ -679,7 +729,14 @@ function buildPayload(domain, rdapData, response) {
   };
 }
 
-function buildWhoisFallbackPayload(domain, fallbackData, sourceUrl, status) {
+function buildWhoisFallbackPayload(
+  domain,
+  fallbackData,
+  sourceUrl,
+  status,
+  source = 'whois-fallback',
+  whoisServer = null
+) {
   const fallbackDomain = normalizeValue(fallbackData.domainName || domain);
   const registrarName = normalizeValue(fallbackData.registrar || fallbackData.organization);
 
@@ -691,7 +748,8 @@ function buildWhoisFallbackPayload(domain, fallbackData, sourceUrl, status) {
     lookup: {
       rdapUrl: normalizeValue(sourceUrl),
       httpStatus: status,
-      source: 'whois-fallback'
+      source,
+      whoisServer: normalizeValue(whoisServer)
     },
     rdap: {
       handle: null,
@@ -719,6 +777,97 @@ function buildWhoisFallbackPayload(domain, fallbackData, sourceUrl, status) {
     service: SERVICE_NAME,
     generatedAt: new Date().toISOString()
   };
+}
+
+async function queryWhoisServer(hostname, queryDomain) {
+  let socket;
+  let reader;
+  let writer;
+
+  try {
+    socket = connect({
+      hostname,
+      port: 43
+    });
+
+    writer = socket.writable.getWriter();
+    const encoder = new TextEncoder();
+    await writer.write(encoder.encode(`${queryDomain}\r\n`));
+    await writer.close();
+
+    reader = socket.readable.getReader();
+    const decoder = new TextDecoder();
+
+    let response = '';
+    const timeoutId = setTimeout(() => {
+      try {
+        reader.cancel();
+      } catch {}
+
+      try {
+        socket.close();
+      } catch {}
+    }, 9000);
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        if (value) {
+          response += decoder.decode(value, { stream: true });
+        }
+      }
+
+      response += decoder.decode();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    return normalizeValue(response.trim());
+  } catch {
+    return null;
+  } finally {
+    try {
+      reader?.releaseLock();
+    } catch {}
+
+    try {
+      writer?.releaseLock();
+    } catch {}
+
+    try {
+      socket?.close();
+    } catch {}
+  }
+}
+
+async function tryWhoisTcpFallback(domain) {
+  const whoisServer = getWhoisServerForDomain(domain);
+  if (!whoisServer) {
+    return null;
+  }
+
+  const rawWhois = await queryWhoisServer(whoisServer, domain);
+  if (!rawWhois || looksLikeWhoisNotFound(rawWhois)) {
+    return null;
+  }
+
+  const fallbackData = extractWhoisFallbackData(rawWhois);
+  if (!hasMeaningfulWhoisData(fallbackData)) {
+    return null;
+  }
+
+  return buildWhoisFallbackPayload(
+    domain,
+    fallbackData,
+    `whois://${whoisServer}/${domain}`,
+    200,
+    'whois-tcp-fallback',
+    whoisServer
+  );
 }
 
 async function tryRuWhoisFallback(domain) {
@@ -758,7 +907,13 @@ async function tryRuWhoisFallback(domain) {
 
   const fallbackData = extractWhoisFallbackData(rawWhois);
 
-  return buildWhoisFallbackPayload(domain, fallbackData, response.url || fallbackUrl, response.status);
+  return buildWhoisFallbackPayload(
+    domain,
+    fallbackData,
+    response.url || fallbackUrl,
+    response.status,
+    'whois-web-fallback'
+  );
 }
 
 async function performWhoisLookup(domain) {
@@ -794,6 +949,14 @@ async function performWhoisLookup(domain) {
   const body = safeJsonParse(rawBody);
 
   if (!response.ok) {
+    const tcpWhoisFallbackPayload = await tryWhoisTcpFallback(domain);
+    if (tcpWhoisFallbackPayload) {
+      return {
+        ok: true,
+        payload: tcpWhoisFallbackPayload
+      };
+    }
+
     const ruFallbackPayload = await tryRuWhoisFallback(domain);
     if (ruFallbackPayload) {
       return {
@@ -810,6 +973,14 @@ async function performWhoisLookup(domain) {
   }
 
   if (!body || typeof body !== 'object') {
+    const tcpWhoisFallbackPayload = await tryWhoisTcpFallback(domain);
+    if (tcpWhoisFallbackPayload) {
+      return {
+        ok: true,
+        payload: tcpWhoisFallbackPayload
+      };
+    }
+
     const ruFallbackPayload = await tryRuWhoisFallback(domain);
     if (ruFallbackPayload) {
       return {
